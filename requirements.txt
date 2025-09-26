@@ -1,6 +1,6 @@
-bitcoin==1.1.42
+bit 
+tqdm 
+cryptography
 requests==2.31.0
 colorama==0.4.6
-tqdm==4.66.1
-cryptography==41.0.7
 pycryptodome==3.19.0
