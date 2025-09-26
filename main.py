@@ -1,3 +1,5 @@
+# getbtc_final_fix.py
+
 import sys
 import requests
 import json
@@ -12,8 +14,8 @@ from typing import Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Pustaka baru yang diperlukan
-# pip install bit tqdm cryptography
-import bit
+# pip install bitcoinlib tqdm cryptography requests
+from bitcoinlib.keys import Key
 from tqdm import tqdm
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
@@ -26,7 +28,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('btc_scanner_upgraded.log'),
+        logging.FileHandler('btc_scanner_final.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -108,8 +110,6 @@ class BlockchainAPI:
         Mengecek saldo menggunakan beberapa API secara berurutan.
         Mengembalikan total saldo dalam satoshi jika berhasil, None jika gagal.
         """
-        # Daftar API (URL, parser_function)
-        # Blockchain.info adalah yang paling andal untuk saldo tunggal.
         apis = [
             (f"https://blockchain.info/balance?active={address}", lambda data: data[address]['final_balance']),
             (f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance", lambda data: data['final_balance']),
@@ -128,9 +128,9 @@ class BlockchainAPI:
                         time.sleep(CONFIG['retry_delay'] * (attempt + 1))
                         continue
                 except (requests.RequestException, json.JSONDecodeError, KeyError):
-                    continue # Coba API berikutnya jika ada error
-            # Jika satu API gagal setelah semua retry, coba API berikutnya.
-        return None # Jika semua API gagal
+                    continue 
+            
+        return None 
 
 class BitcoinScanner:
     """Scanner Bitcoin multithreaded yang efisien."""
@@ -146,12 +146,15 @@ class BitcoinScanner:
     def scan_worker(self) -> None:
         """
         Satu unit pekerjaan: buat kunci, cek saldo, simpan jika ditemukan.
+        (Versi ini menggunakan bitcoinlib untuk kompatibilitas maksimal)
         """
-        # 1. Generate Kunci (menggunakan 'bit' yang lebih cepat)
-        key = bit.Key()
+        try:
+            key = Key()
+        except Exception as e:
+            logger.error(f"Gagal membuat kunci: {e}")
+            return
         
-        # 2. Cek saldo untuk kedua format alamat (compressed & uncompressed)
-        addresses_to_check = [key.address, key.segwit_address] # compressed P2PKH dan P2WPKH
+        addresses_to_check = [key.address(), key.address_segwit()]
         
         for address in addresses_to_check:
             balance = self.api.get_balance(address)
@@ -161,32 +164,31 @@ class BitcoinScanner:
                     with self.lock:
                         self.stats['found'] += 1
                     logger.critical(f"🎉 SALDO DITEMUKAN! Alamat: {address}, Saldo: {balance} satoshi")
-                    SecureKeyManager.save_found_key(key.to_wif(), address, balance, self.password)
-                break # Jika alamat pertama punya saldo, tidak perlu cek yang kedua
+                    wif = key.wif_compressed()
+                    SecureKeyManager.save_found_key(wif, address, balance, self.password)
+                break 
             else:
                 with self.lock:
                     self.stats['api_errors'] += 1
-                break # Jika API gagal, tidak perlu cek alamat lain dari key yang sama
+                break
 
     def run_scan(self):
         """Memulai proses pemindaian menggunakan thread pool."""
         logger.info(f"🚀 Memulai pemindaian dengan {self.max_workers} worker...")
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Membuat progress bar dengan tqdm
             with tqdm(total=self.max_iterations, desc="Mencari Alamat Bitcoin", unit=" kunci") as pbar:
                 futures = {executor.submit(self.scan_worker) for _ in range(self.max_iterations)}
                 
                 for future in as_completed(futures):
                     try:
-                        future.result()  # Menunggu worker selesai
+                        future.result()
                     except Exception as e:
-                        logger.error(f"Error pada worker: {e}")
+                        logger.error(f"Error pada future: {e}")
                     finally:
-                        pbar.update(1) # Update progress bar setelah setiap pekerjaan selesai
+                        pbar.update(1)
                         with self.lock:
                            self.stats['scanned'] += 1
-                           # Opsi: Update deskripsi progress bar secara dinamis
                            pbar.set_postfix(
                                found=self.stats['found'], 
                                errors=self.stats['api_errors'],
@@ -194,33 +196,23 @@ class BitcoinScanner:
                            )
 
         logger.info("📊 Pemindaian selesai.")
-        logger.info(f"Total Alamat Discan: {self.stats['scanned']}")
+        logger.info(f"Total Kunci Discan: {self.stats['scanned']}")
         logger.info(f"Total Dompet Ditemukan: {self.stats['found']}")
         logger.info(f"Total Kegagalan API: {self.stats['api_errors']}")
 
 def main():
     """Fungsi utama untuk menjalankan scanner dari command line."""
     print("================================================")
-    print("    🚀 Bitcoin Address Scanner v2.0 (Upgraded)   ")
-    print("    - Multithreaded, Encrypted, Efficient -     ")
+    print("    🚀 Bitcoin Address Scanner v2.1 (Final Fix)  ")
+    print("    - Multithreaded, Encrypted, Compatible -    ")
     print("================================================")
     print("\n⚠️  DISCLAIMER: Peluang menemukan dompet dengan saldo secara acak")
     print("   adalah SANGAT KECIL, mendekati nol secara astronomis.")
     print("   Skrip ini dibuat untuk tujuan edukasi dan eksperimental.\n")
     
     parser = argparse.ArgumentParser(description="Bitcoin Address Scanner yang Ditingkatkan.")
-    parser.add_argument(
-        '-w', '--workers', 
-        type=int, 
-        default=50, 
-        help='Jumlah thread paralel untuk pemindaian (default: 50).'
-    )
-    parser.add_argument(
-        '-n', '--iterations', 
-        type=int, 
-        default=100000, 
-        help='Jumlah total kunci yang akan digenerate dan dicek (default: 100000).'
-    )
+    parser.add_argument('-w', '--workers', type=int, default=50, help='Jumlah thread paralel untuk pemindaian (default: 50).')
+    parser.add_argument('-n', '--iterations', type=int, default=100000, help='Jumlah total kunci yang akan digenerate dan dicek (default: 100000).')
     args = parser.parse_args()
 
     password = input("Masukkan password untuk ENKRIPSI file hasil temuan (PENTING!): ").strip()
