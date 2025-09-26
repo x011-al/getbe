@@ -1,5 +1,3 @@
-# getbtc_final_fix.py
-
 import sys
 import requests
 import json
@@ -10,11 +8,10 @@ import os
 import threading
 import argparse
 from datetime import datetime
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Pustaka baru yang diperlukan
-# pip install bitcoinlib tqdm cryptography requests
+# Pustaka yang diperlukan: pip install bitcoinlib tqdm cryptography requests
 from bitcoinlib.keys import Key
 from tqdm import tqdm
 from cryptography.fernet import Fernet
@@ -34,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Konfigurasi Default (dapat di-override via CLI) ---
+# --- Konfigurasi Default ---
 CONFIG = {
     'api_timeout': 15,
     'retry_delay': 5,
@@ -50,22 +47,17 @@ WEB_HEADERS = {
 
 class SecureKeyManager:
     """Manager untuk handling private key yang aman dengan enkripsi nyata."""
-
+    
     @staticmethod
     def _derive_key(password: str, salt: bytes) -> bytes:
-        """Mendapatkan kunci enkripsi dari password menggunakan PBKDF2."""
         kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-            backend=default_backend()
+            algorithm=hashes.SHA256(), length=32, salt=salt,
+            iterations=100000, backend=default_backend()
         )
         return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
     @staticmethod
     def encrypt_data(data: dict, password: str) -> str:
-        """Enkripsi data JSON dengan password."""
         salt = os.urandom(16)
         key = SecureKeyManager._derive_key(password, salt)
         f = Fernet(key)
@@ -74,27 +66,20 @@ class SecureKeyManager:
 
     @staticmethod
     def save_found_key(private_key_wif: str, address: str, balance: int, password: str):
-        """Simpan private key yang ditemukan dengan enkripsi yang kuat."""
         try:
             os.makedirs(CONFIG['results_dir'], exist_ok=True)
-            
             data_to_encrypt = {
                 'address': address,
                 'private_key_wif': private_key_wif,
                 'balance_satoshi': balance,
                 'timestamp': datetime.now().isoformat()
             }
-            
             encrypted_content = SecureKeyManager.encrypt_data(data_to_encrypt, password)
-            
             filename = f"FOUND_{address}.enc"
             filepath = os.path.join(CONFIG['results_dir'], filename)
-            
             with open(filepath, 'w') as f:
                 f.write(encrypted_content)
-            
             logger.critical(f"Kunci untuk alamat {address} DITEMUKAN dan DIENKRIPSI ke file: {filepath}")
-            
         except Exception as e:
             logger.error(f"Gagal menyimpan dan mengenkripsi kunci: {e}")
 
@@ -106,16 +91,11 @@ class BlockchainAPI:
         self.session.headers.update(WEB_HEADERS)
         
     def get_balance(self, address: str) -> Optional[int]:
-        """
-        Mengecek saldo menggunakan beberapa API secara berurutan.
-        Mengembalikan total saldo dalam satoshi jika berhasil, None jika gagal.
-        """
         apis = [
             (f"https://blockchain.info/balance?active={address}", lambda data: data[address]['final_balance']),
             (f"https://api.blockcypher.com/v1/btc/main/addrs/{address}/balance", lambda data: data['final_balance']),
             (f"https://blockstream.info/api/address/{address}", lambda data: data['chain_stats']['funded_txo_sum'] - data['chain_stats']['spent_txo_sum']),
         ]
-
         for url, parser in apis:
             for attempt in range(CONFIG['max_retries']):
                 try:
@@ -124,13 +104,12 @@ class BlockchainAPI:
                         data = response.json()
                         balance = parser(data)
                         return int(balance)
-                    elif response.status_code == 429: # Rate limited
+                    elif response.status_code == 429:
                         time.sleep(CONFIG['retry_delay'] * (attempt + 1))
                         continue
                 except (requests.RequestException, json.JSONDecodeError, KeyError):
-                    continue 
-            
-        return None 
+                    continue
+        return None
 
 class BitcoinScanner:
     """Scanner Bitcoin multithreaded yang efisien."""
@@ -146,7 +125,6 @@ class BitcoinScanner:
     def scan_worker(self) -> None:
         """
         Satu unit pekerjaan: buat kunci, cek saldo, simpan jika ditemukan.
-        (Versi ini menggunakan bitcoinlib untuk kompatibilitas maksimal)
         """
         try:
             key = Key()
@@ -154,11 +132,42 @@ class BitcoinScanner:
             logger.error(f"Gagal membuat kunci: {e}")
             return
         
-        addresses_to_check = [key.address(), key.address_segwit()]
+        # === PERBAIKAN FINAL v2.4 ===
+        # Menggunakan metode yang benar dan kompatibel dengan semua versi bitcoinlib
+        addresses_to_check = []
         
+        try:
+            # Address legacy (P2PKH) - selalu tersedia
+            addresses_to_check.append(key.address())
+        except Exception as e:
+            logger.warning(f"Gagal mendapatkan address legacy: {e}")
+        
+        try:
+            # Address SegWit (Bech32) - jika tersedia di versi library
+            if hasattr(key, 'address_bech32'):
+                addresses_to_check.append(key.address_bech32())
+            elif hasattr(key, 'address_segwit'):
+                addresses_to_check.append(key.address_segwit())
+            else:
+                # Fallback: coba buat address segwit manual
+                try:
+                    from bitcoinlib.keys import Address
+                    segwit_addr = Address(compressed=key.compressed, 
+                                         witness_type='segwit', 
+                                         key=key).address
+                    addresses_to_check.append(segwit_addr)
+                except:
+                    pass
+        except Exception as e:
+            logger.warning(f"Gagal mendapatkan address segwit: {e}")
+        
+        # Jika tidak ada address yang berhasil dibuat, skip
+        if not addresses_to_check:
+            logger.error("Tidak ada address yang berhasil dibuat, skip...")
+            return
+            
         for address in addresses_to_check:
             balance = self.api.get_balance(address)
-
             if balance is not None:
                 if balance > 0:
                     with self.lock:
@@ -166,20 +175,17 @@ class BitcoinScanner:
                     logger.critical(f"🎉 SALDO DITEMUKAN! Alamat: {address}, Saldo: {balance} satoshi")
                     wif = key.wif_compressed()
                     SecureKeyManager.save_found_key(wif, address, balance, self.password)
-                break 
+                break
             else:
                 with self.lock:
                     self.stats['api_errors'] += 1
                 break
 
     def run_scan(self):
-        """Memulai proses pemindaian menggunakan thread pool."""
         logger.info(f"🚀 Memulai pemindaian dengan {self.max_workers} worker...")
-        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             with tqdm(total=self.max_iterations, desc="Mencari Alamat Bitcoin", unit=" kunci") as pbar:
                 futures = {executor.submit(self.scan_worker) for _ in range(self.max_iterations)}
-                
                 for future in as_completed(futures):
                     try:
                         future.result()
@@ -194,16 +200,14 @@ class BitcoinScanner:
                                errors=self.stats['api_errors'],
                                refresh=True
                            )
-
         logger.info("📊 Pemindaian selesai.")
         logger.info(f"Total Kunci Discan: {self.stats['scanned']}")
         logger.info(f"Total Dompet Ditemukan: {self.stats['found']}")
         logger.info(f"Total Kegagalan API: {self.stats['api_errors']}")
 
 def main():
-    """Fungsi utama untuk menjalankan scanner dari command line."""
     print("================================================")
-    print("    🚀 Bitcoin Address Scanner v2.1 (Final Fix)  ")
+    print("   🚀 Bitcoin Address Scanner v2.4 (Fixed)      ")
     print("    - Multithreaded, Encrypted, Compatible -    ")
     print("================================================")
     print("\n⚠️  DISCLAIMER: Peluang menemukan dompet dengan saldo secara acak")
@@ -222,7 +226,6 @@ def main():
         
     confirm = input(
         f"\nAnda akan memulai pemindaian {args.iterations} kunci menggunakan {args.workers} worker."
-        f"\nFile yang ditemukan akan disimpan di direktori '{CONFIG['results_dir']}'."
         f"\nLanjutkan? (y/n): "
     ).strip().lower()
 
